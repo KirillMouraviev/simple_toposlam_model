@@ -1,0 +1,14 @@
+<launch>
+  <arg name="scene_name" default="2n8kARJN3HM"/>
+  <arg name="iou_threshold" default="0.25"/>
+
+  <node pkg="simple_toposlam_model" type="simple_toposlam_model_node.py" name="simple_toposlam_model_node" output="screen">
+    <param name="scene_name" value="$(arg scene_name)"/>
+    <param name="path_to_save_json" value="/home/kirill/TopoSLAM/toposlam_ws/src/simple_toposlam_model/graph_jsons_new/$(arg scene_name)_$(arg iou_threshold).json"/>
+    <param name="iou_threshold" value="$(arg iou_threshold)"/>
+  </node>
+
+  <node pkg="simple_toposlam_model" type="line_of_sight_node" name="line_of_sight_node">
+    <remap from="/map" to="/habitat/gt_map"/>
+  </node>
+</launch>
