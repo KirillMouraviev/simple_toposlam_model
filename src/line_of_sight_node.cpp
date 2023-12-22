@@ -9,7 +9,7 @@
 #include "simple_toposlam_model/line_of_sight.hpp"
 #include "simple_toposlam_model/map.hpp"
 
-#define DEFAULT_AGENT_RADIUS 0.2
+#define DEFAULT_AGENT_RADIUS 0.1
 
 Map map;
 bool map_is_updated = false;

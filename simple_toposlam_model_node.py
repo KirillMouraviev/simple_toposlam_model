@@ -1,16 +1,18 @@
 #!/usr/bin/env python
 
 import rospy
+import numpy as np
+np.float = np.float64
 import ros_numpy
 import os
+import sys
 import tf
-import numpy as np
 from localization import Localizer
 from gt_map import GTMap
 #from mapping import Mapper
 from topo_graph import TopologicalGraph
 from sensor_msgs.msg import PointCloud2
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Point
 from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 from visualization_msgs.msg import Marker
@@ -32,9 +34,14 @@ class TopoSLAMModel():
         self.pcd_subscriber = rospy.Subscriber('/habitat/points', PointCloud2, self.pcd_callback)
         self.pose_subscriber = rospy.Subscriber('/true_pose', PoseStamped, self.pose_callback)
         self.in_sight_response_subscriber = rospy.Subscriber('/response', Float32MultiArray, self.in_sight_callback)
+        self.localization_subscriber = rospy.Subscriber('/localized_nodes', Float32MultiArray, self.localization_callback)
         self.gt_map_publisher = rospy.Publisher('/habitat/gt_map', OccupancyGrid, latch=True, queue_size=100)
         self.task_publisher = rospy.Publisher('/task', Float32MultiArray, latch=True, queue_size=100)
         self.last_vertex_publisher = rospy.Publisher('/last_vertex', Marker, latch=True, queue_size=100)
+        self.localization_results_publisher = rospy.Publisher('/localized_vertices', Marker, latch=True, queue_size=100)
+        self.localization_time = 0
+        self.localization_results = ([], [], [])
+        rospy.Timer(rospy.Duration(1.0), self.localizer.localize)
         self.last_vertex = None
         self.last_vertex_id = None
         self.prev_x = None
@@ -49,13 +56,17 @@ class TopoSLAMModel():
         self.cur_grids_transformed = []
         self.ref_grids = []
 
-    def get_xy_coords_from_msg(self, msg):
+    def get_xyz_coords_from_msg(self, msg):
         points_numpify = ros_numpy.point_cloud2.pointcloud2_to_array(msg)
         points_numpify = ros_numpy.point_cloud2.split_rgb_field(points_numpify)
         points_x = np.array([x[2] for x in points_numpify])[:, np.newaxis]
         points_y = np.array([-x[0] for x in points_numpify])[:, np.newaxis]
-        points_xy = np.concatenate([points_x, points_y], axis=1)
-        return points_xy
+        points_z = np.array([-x[1] for x in points_numpify])[:, np.newaxis]
+        points_r = np.array([x[3] for x in points_numpify])[:, np.newaxis]
+        points_g = np.array([x[4] for x in points_numpify])[:, np.newaxis]
+        points_b = np.array([x[5] for x in points_numpify])[:, np.newaxis]
+        points_xyz = np.concatenate([points_x, points_y, points_z, points_r, points_g, points_b], axis=1)
+        return points_xyz
 
     def transform_pcd(self, points, x, y, theta):
         points_transformed = points.copy()
@@ -65,11 +76,11 @@ class TopoSLAMModel():
         points_transformed[:, 1] -= y
         return points_transformed
 
-    def get_occupancy_grid(self, points_xy):
-        points_xy = np.clip(points_xy, -8, 8)
+    def get_occupancy_grid(self, points_xyz):
+        points_xyz = np.clip(points_xyz, -8, 8)
         resolution = 0.1
         radius = 18
-        points_ij = np.round(points_xy / resolution).astype(int) + [int(radius / resolution), int(radius / resolution)]
+        points_ij = np.round(points_xyz[:, :2] / resolution).astype(int) + [int(radius / resolution), int(radius / resolution)]
         grid = np.zeros((int(2 * radius / resolution), int(2 * radius / resolution)), dtype=np.uint8)
         grid[points_ij[:, 0], points_ij[:, 1]] = 1
         return grid
@@ -128,6 +139,87 @@ class TopoSLAMModel():
         orientation = msg.pose.orientation
         _, __, theta = tf.transformations.euler_from_quaternion([orientation.x, orientation.y, orientation.z, orientation.w])
         self.poses.append([msg.header.stamp.to_sec(), x, y, theta])
+
+    def publish_localization_results(self, vertex_ids):
+        vertices_marker = Marker()
+        #vertices_marker = ns = 'points_and_lines'
+        vertices_marker.type = Marker.POINTS
+        vertices_marker.id = 0
+        vertices_marker.header.frame_id = 'map'
+        vertices_marker.header.stamp = rospy.Time.now()
+        vertices_marker.scale.x = 0.2
+        vertices_marker.scale.y = 0.2
+        vertices_marker.scale.z = 0.2
+        vertices_marker.color.r = 1
+        vertices_marker.color.g = 1
+        vertices_marker.color.b = 0
+        vertices_marker.color.a = 1
+        localized_vertices = [self.graph.vertices[i] for i in vertex_ids]
+        for x, y, theta, cloud in localized_vertices:
+            vertices_marker.points.append(Point(x, y, 0.1))
+        self.localization_results_publisher.publish(vertices_marker)
+        
+    def localization_callback(self, msg):
+        self.localization_time = rospy.Time.now().to_sec()
+        #self.publish_cur_cloud()
+        n = msg.layout.dim[0].size // 3
+        vertex_ids = [int(x) for x in msg.data[:n]]
+        thetas = msg.data[n:2 * n]
+        dists = msg.data[2 * n:3 * n]
+        self.localization_results = (vertex_ids, thetas, dists)
+        print('Localized in vertices', vertex_ids)
+        self.publish_localization_results(vertex_ids)
+        x = self.localizer.localized_x
+        y = self.localizer.localized_y
+        theta = self.localizer.localized_theta
+        cloud = self.localizer.localized_cloud
+        if len(vertex_ids) == 0:
+            return
+        if self.last_vertex is None:
+            self.last_vertex_id = vertex_ids[0]
+            self.last_vertex = self.graph.get_vertex(vertex_ids[0])
+        else:
+            found_loop_closure = False
+            for i in range(len(vertex_ids)):
+                for j in range(len(vertex_ids)):
+                    u = vertex_ids[i]
+                    v = vertex_ids[j]
+                    path, path_len = self.graph.get_path_with_length(u, v)
+                    dst_through_cur = dists[i] + dists[j]
+                    if path_len > 5 and path_len > 2 * dst_through_cur:
+                        print('u:', self.graph.get_vertex(u)[0], self.graph.get_vertex(u)[1])
+                        print('v:', self.graph.get_vertex(v)[0], self.graph.get_vertex(v)[1])
+                        print('Path in graph:', path_len)
+                        print('Path through cur:', dst_through_cur)
+                        found_loop_closure = True
+                        break
+                if found_loop_closure:
+                    break
+            if found_loop_closure:
+                print('Found loop closure. Add new vertex to close loop')
+                new_vertex_id = self.graph.add_vertex(x, y, theta, cloud)
+                self.last_vertex_id = new_vertex_id
+                self.last_vertex = self.graph.get_vertex(new_vertex_id)
+                for i in range(len(vertex_ids)):
+                    self.graph.add_edge(new_vertex_id, vertex_ids[i], thetas[i], dists[i])
+            else:
+                found_proper_vertex = False
+                for v in vertex_ids:
+                    vx, vy, vtheta, vcloud = self.graph.get_vertex(v)
+                    if (v == self.last_vertex_id or self.graph.has_edge(v, self.last_vertex_id)) and \
+                        self.get_iou(vx, vy, vtheta, vcloud, self.last_vertex) > self.iou_threshold2:
+                        print('Change vertex to ({}, {})'.format(self.graph.get_vertex(v)[0], self.graph.get_vertex(v)[1]))
+                        found_proper_vertex = True
+                        self.last_vertex_id = v
+                        self.last_vertex = self.graph.get_vertex(v)
+                        break
+                if not found_proper_vertex:
+                    print('No proper vertex to change. Add new vertex')
+                    new_vertex_id = self.graph.add_vertex(x, y, theta, cloud)
+                    self.last_vertex_id = new_vertex_id
+                    self.last_vertex = self.graph.get_vertex(new_vertex_id)
+                    for i in range(len(vertex_ids)):
+                        self.graph.add_edge(new_vertex_id, vertex_ids[i], thetas[i], dists[i])
 
     def get_sync_pose(self, timestamp):
         if len(self.poses) == 0:
@@ -206,61 +298,60 @@ class TopoSLAMModel():
             self.prev_y = y
             self.prev_theta = theta
             self.prev_cloud = cur_cloud
-        in_sight = None
-        iou = None
-        if self.last_vertex is not None:
-            in_sight = self.is_in_sight(x, y, self.last_vertex[0], self.last_vertex[1])
-            iou = self.get_iou(x, y, theta, cur_cloud, self.last_vertex)
-            if in_sight is None:
-                print('Failed to check straight-line visibility!')
-                return
+        if self.last_vertex is None:
+            print('Add new vertex at start')
+            new_vertex_id = self.graph.add_vertex(x, y, theta, cur_cloud)
+            self.last_vertex_id = new_vertex_id
+            self.last_vertex = self.graph.get_vertex(new_vertex_id)
+        in_sight = self.is_in_sight(x, y, self.last_vertex[0], self.last_vertex[1])
+        iou = self.get_iou(x, y, theta, cur_cloud, self.last_vertex)
         #print('In sight:', in_sight)
         #print('IoU:', iou)
-        t2 = rospy.Time.now().to_sec()
-        if self.last_vertex is None or iou < self.iou_threshold or not in_sight:
-            if self.last_vertex is not None:
-                print('Last vertex:', self.last_vertex[0], self.last_vertex[1])
-            vertex_ids, rel_poses, dists = self.localizer.localize(x, y, theta)
-            t3 = rospy.Time.now().to_sec()
-            #print('Localization time:', t3 - t2)
-            if len(rel_poses) == 0:
-                print('Localization failed. Add new vertex')
-                prev_vertex_ids, prev_rel_poses, prev_dists = self.localizer.localize(self.prev_x, self.prev_y, self.prev_theta)
-                new_vertex_id = self.graph.add_vertex(self.prev_x, self.prev_y, self.prev_theta, self.prev_cloud)
-                self.last_vertex = self.graph.get_vertex(new_vertex_id)
-                self.last_vertex_id = new_vertex_id
-                for vertex_id in prev_vertex_ids:
-                    self.graph.add_edge(new_vertex_id, vertex_id)
-                self.graph.publish_graph()
-                t4 = rospy.Time.now().to_sec()
-                #print('Vertex addition time:', t4 - t3)
+        if in_sight is None:
+            print('Failed to check straight-line visibility!')
+            return
+        if iou < self.iou_threshold or not in_sight:
+            if not in_sight:
+                print('Out of visibility')
             else:
+                print('Low IoU')
+            if rospy.Time.now().to_sec() - self.localization_time < 1:
+                vertex_ids, thetas, dists = self.localization_results
                 found_proper_vertex = False
                 for v in vertex_ids:
-                    if v == self.last_vertex_id:
-                        continue
-                    neighbour_vertex = self.graph.get_vertex(v)
-                    print('Vertex:', neighbour_vertex[0], neighbour_vertex[1])
-                    iou = self.get_iou(x, y, theta, cur_cloud, neighbour_vertex)
-                    print('IoU:', iou)
+                    iou = self.get_iou(x, y, theta, cur_cloud, self.graph.get_vertex(v))
+                    print('IoU between ({}, {}) and ({}, {}) is {}'.format(x, y, self.graph.get_vertex(v)[0], self.graph.get_vertex(v)[1], iou))
                     print('Has edge:', self.graph.has_edge(self.last_vertex_id, v))
-                    if iou >= self.iou_threshold and self.graph.has_edge(self.last_vertex_id, v):
-                        print('Change to vertex', neighbour_vertex[0], neighbour_vertex[1])
-                        self.last_vertex = neighbour_vertex
-                        self.last_vertex_id = v
+                    if self.graph.has_edge(self.last_vertex_id, v) and iou > self.iou_threshold2:
                         found_proper_vertex = True
+                        self.last_vertex_id = v
+                        self.last_vertex = self.graph.get_vertex(v)
+                        print('Change to vertex ({}, {})'.format(self.last_vertex[0], self.last_vertex[1]))
                         break
                 if not found_proper_vertex:
                     print('No proper vertex to change. Add new vertex')
                     new_vertex_id = self.graph.add_vertex(self.prev_x, self.prev_y, self.prev_theta, self.prev_cloud)
-                    self.last_vertex = self.graph.get_vertex(new_vertex_id)
+                    new_vertex = self.graph.get_vertex(new_vertex_id)
+                    rel_x, rel_y, rel_theta = self.get_rel_pose(self.last_vertex[0], self.last_vertex[1], self.last_vertex[2], 
+                                                                new_vertex[0], new_vertex[1], new_vertex[2])
+                    theta = np.arctan2(rel_y, rel_x)
+                    dst = np.sqrt(rel_x ** 2 + rel_y ** 2)
+                    self.graph.add_edge(new_vertex_id, self.last_vertex_id, theta, dst)
+                    for v, theta, dst in zip(vertex_ids, thetas, dists):
+                        self.graph.add_edge(new_vertex_id, v, theta, dst)
                     self.last_vertex_id = new_vertex_id
-                    prev_vertex_ids, prev_rel_poses, prev_dists = self.localizer.localize(self.prev_x, self.prev_y, self.prev_theta)
-                    for vertex_id in prev_vertex_ids:
-                        self.graph.add_edge(new_vertex_id, vertex_id)
-                    self.graph.publish_graph()
-                t4 = rospy.Time.now().to_sec()
-                #print('Vertex addition time 2:', t4 - t3)
+                    self.last_vertex = new_vertex
+            else:
+                new_vertex_id = self.graph.add_vertex(self.prev_x, self.prev_y, self.prev_theta, self.prev_cloud)
+                new_vertex = self.graph.get_vertex(new_vertex_id)
+                rel_x, rel_y, rel_theta = self.get_rel_pose(self.last_vertex[0], self.last_vertex[1], self.last_vertex[2], 
+                                                            new_vertex[0], new_vertex[1], new_vertex[2])
+                theta = np.arctan2(rel_y, rel_x)
+                dst = np.sqrt(rel_x ** 2 + rel_y ** 2)
+                self.graph.add_edge(new_vertex_id, self.last_vertex_id, theta, dst)
+                self.last_vertex_id = new_vertex_id
+                self.last_vertex = self.graph.get_vertex(new_vertex_id)
+        self.graph.publish_graph()
         self.publish_last_vertex()
         self.prev_x = x
         self.prev_y = y
@@ -276,19 +367,14 @@ class TopoSLAMModel():
             if rospy.Time.now().to_sec() - start_time > 0.5:
                 print('Waiting for sync pose timed out!')
                 return
-        #print('Time of waiting for sync pose:', rospy.Time.now().to_sec() - start_time)
         cur_x, cur_y, cur_theta = cur_pose
-        t2 = rospy.Time.now().to_sec()
-        cur_cloud = self.get_xy_coords_from_msg(msg)
-        t3 = rospy.Time.now().to_sec()
+        cur_cloud = self.get_xyz_coords_from_msg(msg)
         self.localizer.x = cur_x
         self.localizer.y = cur_y
         self.localizer.theta = cur_theta
         self.localizer.cloud = cur_cloud
-        #print('Time of extracting point cloud:', t3 - t2)
+        self.localizer.stamp = msg.header.stamp
         self.update_by_iou(cur_x, cur_y, cur_theta, cur_cloud, msg.header.stamp)
-        t4 = rospy.Time.now().to_sec()
-        #print('Time of updating graph:', t4 - t3)
 
     def save_graph(self, save_dir='src/simple_toposlam_model/grids'):
         self.graph.save_to_json(self.path_to_save_json)
